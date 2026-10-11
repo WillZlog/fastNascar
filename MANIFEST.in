@@ -1,6 +1,6 @@
-include README.md LICENSE pyproject.toml
+include README.md CHANGELOG.md LICENSE pyproject.toml
 recursive-include src *.py
-recursive-include examples *.py *.ps1
+recursive-include examples *.py
 recursive-include tests *.py *.json *.md
 prune build
 prune dist

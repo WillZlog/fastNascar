@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastnascar"
-version = "0.1.0"
-description = "Pandas-based NASCAR sessions, laps, results, and live timing"
+version = "0.2.0"
+description = "NASCAR timing, pit stops, pace analysis, and live recording in pandas"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

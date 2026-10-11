@@ -5,6 +5,7 @@ import pandas as pd
 
 from .api import NASCARClient
 from ._time import seconds_to_timedelta
+from .series import resolve_series
 from .exceptions import (AmbiguousEventError, DataNotAvailableError,
                          EventNotFoundError, InvalidDataError, SessionNotLoadedError)
 
@@ -205,32 +206,35 @@ def parse_track_status(payload):
     return frame
 
 
-def get_event_schedule(year, *, include_exhibition=False, refresh=False, client=None):
-    """Fetch a Cup season schedule, assigning rounds to points races.
+def get_event_schedule(year, *, series=1, include_exhibition=False, refresh=False, client=None):
+    """Fetch a season schedule, assigning rounds to points races.
 
     Args:
         year (int): Season year, between 1949 and 2100. Feed coverage varies.
+        series (int or str): Cup/1, Xfinity/2, or Trucks/3.
         include_exhibition (bool): Include exhibitions with RoundNumber zero.
         refresh (bool): Bypass a fresh schedule cache entry.
         client (NASCARClient, optional): Client to use instead of a new instance.
 
     Returns:
         pandas.DataFrame: RoundNumber, RaceId, EventName, TrackName, EventDate,
-        Year, and IsExhibition. Rows follow scheduled dates; EventDate retains
+        Year, SeriesId, and IsExhibition. Rows follow scheduled dates; EventDate retains
         the source's naive local race timestamp, including postponements.
 
     Raises:
         ValueError: The year is outside the accepted integer range.
         DataNotAvailableError: The season feed cannot be fetched.
-        InvalidDataError: The feed lacks the expected Cup schedule schema.
+        InvalidDataError: The feed lacks the selected series schedule schema.
     """
     if not isinstance(year, Integral) or isinstance(year, bool) or not 1949 <= year <= 2100:
         raise ValueError("year must be an integer between 1949 and 2100")
+    series_id = resolve_series(series)
     payload = (client or NASCARClient()).schedule(int(year), refresh=refresh)
-    if not isinstance(payload, dict) or not isinstance(payload.get("series_1"), list):
-        raise InvalidDataError("Expected series_1 in the Cup schedule")
+    key = f"series_{series_id}"
+    if not isinstance(payload, dict) or not isinstance(payload.get(key), list):
+        raise InvalidDataError(f"Expected {key} in the schedule")
     rows, round_number = [], 0
-    events = payload["series_1"]
+    events = payload[key]
     if any(not isinstance(r, dict) or "race_id" not in r for r in events):
         raise InvalidDataError("Expected race_id in each schedule event")
     for race in sorted(events, key=lambda r: r.get("date_scheduled") or r.get("race_date") or ""):
@@ -242,20 +246,21 @@ def get_event_schedule(year, *, include_exhibition=False, refresh=False, client=
         rows.append({"RoundNumber": round_number if points_race else 0,
                      "RaceId": race["race_id"], "EventName": race.get("race_name"),
                      "TrackName": race.get("track_name"), "EventDate": race.get("race_date"),
-                     "Year": int(year), "IsExhibition": not points_race})
-    schedule = pd.DataFrame(rows, columns=["RoundNumber", "RaceId", "EventName", "TrackName", "EventDate", "Year", "IsExhibition"])
+                     "Year": int(year), "SeriesId": series_id, "IsExhibition": not points_race})
+    schedule = pd.DataFrame(rows, columns=["RoundNumber", "RaceId", "EventName", "TrackName", "EventDate", "Year", "SeriesId", "IsExhibition"])
     schedule["EventDate"] = pd.to_datetime(schedule.EventDate, errors="coerce")
     return schedule
 
 
-def get_event(year, event=None, *, race_id=None, client=None):
-    """Find one Cup event by round, name, track, or NASCAR race ID.
+def get_event(year, event=None, *, race_id=None, series=1, client=None):
+    """Find one event by round, name, track, or NASCAR race ID.
 
     Args:
         year (int): Season year.
         event (int or str, optional): Positive points-race round, exact event
             name, or case-insensitive substring of an event or track name.
         race_id (int, optional): Explicit NASCAR ID; takes precedence over event.
+        series (int or str): Cup/1, Xfinity/2, or Trucks/3.
         client (NASCARClient, optional): Client used to fetch the schedule.
 
     Returns:
@@ -271,7 +276,7 @@ def get_event(year, event=None, *, race_id=None, client=None):
     Exact event-name matches take priority over substring matches. Select
     exhibitions by name or race ID rather than round zero.
     """
-    schedule = get_event_schedule(year, include_exhibition=True, client=client)
+    schedule = get_event_schedule(year, series=series, include_exhibition=True, client=client)
     if race_id is not None:
         matches = schedule.loc[schedule.RaceId == race_id]
     elif isinstance(event, Integral) and not isinstance(event, bool):
@@ -287,7 +292,7 @@ def get_event(year, event=None, *, race_id=None, client=None):
     else:
         raise ValueError("Provide a round, event/track name, or race_id")
     if matches.empty:
-        raise EventNotFoundError(f"No Cup event in {year} matches {event or race_id!r}")
+        raise EventNotFoundError(f"No event in series {resolve_series(series)}, {year} matches {event or race_id!r}")
     if len(matches) > 1:
         choices = ", ".join(f"{r.EventName} (race_id={r.RaceId})" for r in matches.itertuples())
         raise AmbiguousEventError(f"Multiple events match: {choices}")
@@ -295,7 +300,7 @@ def get_event(year, event=None, *, race_id=None, client=None):
 
 
 class Session:
-    """A Cup race or weekend run with lazily loaded pandas tables.
+    """A race or weekend run with lazily loaded pandas tables.
 
     Obtain a session with ``get_session`` and call ``load`` before accessing
     its tables. ``event`` holds the schedule row; ``raw_data`` keeps loaded feeds.
@@ -317,6 +322,7 @@ class Session:
         self.name = aliases.get(str(identifier).casefold(), str(identifier))
         self._laps = self._results = None
         self._track_status = None
+        self._pit_stops = self._race_control_messages = None
         self.raw_data = {}
 
     @property
@@ -339,6 +345,20 @@ class Session:
         if self._track_status is None:
             raise SessionNotLoadedError("Track status is not loaded; call load(laps=True)")
         return self._track_status
+
+    @property
+    def pit_stops(self):
+        """pandas.DataFrame: Pit timing; load with ``pit_stops=True`` first."""
+        if self._pit_stops is None:
+            raise SessionNotLoadedError("Call load(pit_stops=True) to load pit timing")
+        return self._pit_stops
+
+    @property
+    def race_control_messages(self):
+        """pandas.DataFrame: Race notes; load with ``messages=True`` first."""
+        if self._race_control_messages is None:
+            raise SessionNotLoadedError("Call load(messages=True) to load race notes")
+        return self._race_control_messages
 
     @property
     def drivers(self):
@@ -364,13 +384,15 @@ class Session:
             raise KeyError(identifier)
         return rows.iloc[0]
 
-    def load(self, *, laps=True, results=True, refresh=False):
+    def load(self, *, laps=True, results=True, pit_stops=False, messages=False, refresh=False):
         """Fetch requested datasets and replace session tables after parsing succeeds.
 
         Args:
             laps (bool): Load race laps and leader-lap flags. Set False for
                 practice or qualifying, whose historical lap feeds are unsupported.
             results (bool): Load the race or run's results.
+            pit_stops (bool): Load race pit-road and stationary service timing.
+            messages (bool): Load race commentary by leader lap.
             refresh (bool): Bypass fresh cache entries for requested feeds.
 
         Returns:
@@ -385,13 +407,15 @@ class Session:
         tables unchanged. Use an exact run name if a weekend has multiple runs
         of the same type. The source qualifying run may cover only its final round.
         """
-        if laps and self.name != "Race":
+        if (laps or pit_stops or messages) and self.name != "Race":
             raise DataNotAvailableError("Historical practice/qualifying lap feeds are not supported; use load(laps=False) for results")
         year, race_id = int(self.event.Year), int(self.event.RaceId)
+        series_id = int(self.event.get("SeriesId", 1))
         new_laps, new_results, raw = self._laps, self._results, self.raw_data.copy()
         new_status = self._track_status
+        new_pits, new_messages = self._pit_stops, self._race_control_messages
         if results:
-            weekend = self._client.weekend(year, race_id, refresh=refresh)
+            weekend = self._client.weekend(year, race_id, series=series_id, refresh=refresh)
             if not isinstance(weekend, dict):
                 raise InvalidDataError("Expected a weekend-feed object")
             if self.name == "Race":
@@ -406,16 +430,27 @@ class Session:
             new_results = parse_results(candidates[0].get("results", []))
             raw["weekend"] = weekend
         if laps:
-            payload = self._client.laps(year, race_id, refresh=refresh)
+            payload = self._client.laps(year, race_id, series=series_id, refresh=refresh)
             new_laps = parse_laps(payload)
             new_status = parse_track_status(payload)
             raw["laps"] = payload
+        if pit_stops or messages:
+            from .datasets import parse_pit_stops, parse_messages
+            if pit_stops:
+                payload = self._client.pit_stops(year, race_id, series=series_id, refresh=refresh)
+                new_pits = parse_pit_stops(payload)
+                raw["pit_stops"] = payload
+            if messages:
+                payload = self._client.notes(year, race_id, series=series_id, refresh=refresh)
+                new_messages = parse_messages(payload)
+                raw["messages"] = payload
         self._laps, self._results, self.raw_data = new_laps, new_results, raw
         self._track_status = new_status
+        self._pit_stops, self._race_control_messages = new_pits, new_messages
         return self
 
 
-def get_session(year, event=None, identifier="R", *, race_id=None, client=None):
+def get_session(year, event=None, identifier="R", *, race_id=None, series=1, client=None):
     """Select an event and return an unloaded session.
 
     Args:
@@ -423,6 +458,7 @@ def get_session(year, event=None, identifier="R", *, race_id=None, client=None):
         event (int or str, optional): Points-race round or event/track selector.
         identifier (str): R/Race, P/Practice, Q/Qualifying, or exact run name.
         race_id (int, optional): NASCAR race ID, taking precedence over event.
+        series (int or str): Cup/1, Xfinity/2, or Trucks/3.
         client (NASCARClient, optional): Shared client for selection and loading.
 
     Returns:
@@ -437,4 +473,4 @@ def get_session(year, event=None, identifier="R", *, race_id=None, client=None):
         InvalidDataError: The schedule schema is unsupported.
     """
     client = client or NASCARClient()
-    return Session(get_event(year, event, race_id=race_id, client=client), identifier, client=client)
+    return Session(get_event(year, event, race_id=race_id, series=series, client=client), identifier, client=client)

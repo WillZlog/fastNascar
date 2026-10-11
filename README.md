@@ -1,6 +1,6 @@
 # FastNASCAR
 
-FastNASCAR provides NASCAR Cup lap times, results, and live timing in pandas.
+FastNASCAR provides NASCAR lap times, results, pit timing, and pace analysis in pandas.
 Select a race, load the session, and work with its lap data:
 
 ```python
@@ -11,7 +11,7 @@ hocevar = session.laps.pick_driver("77")
 print(hocevar.pick_fastest())
 ```
 
-Early release. Race laps and weekend results work; historical practice and
+Supports Cup, Xfinity, and Trucks. Historical practice and
 qualifying laps aren't supported yet. No throttle, brake, RPM, or GPS telemetry.
 This project is unaffiliated with NASCAR.
 
@@ -34,6 +34,9 @@ session = fastnascar.get_session(2026, 29)
 session = fastnascar.get_session(2026, "Bass Pro Shops Night Race")
 session = fastnascar.get_session(2026, race_id=5626)
 session.load()
+
+# Other series use the same API.
+trucks = fastnascar.get_session(2026, race_id=5686, series="Trucks").load()
 ```
 
 Rounds count points races in scheduled order. Use
@@ -69,6 +72,50 @@ identify cautions or pit laps.
 Flags refer to leader laps and stay separate from car laps. A lapped car's lap
 number doesn't line up with the leader's. FlagState contains raw feed codes.
 
+## Pace and pit analysis
+
+```python
+session.load(pit_stops=True, messages=True)
+print(session.pit_stops)
+print(session.race_control_messages)
+
+# Best complete consecutive 10-lap averages, ranked across the field.
+print(fastnascar.best_lap_average(session.laps, window=10))
+pace = fastnascar.rolling_pace(session.laps.pick_driver("77"), window=10)
+delta = fastnascar.compare_drivers(session.laps, "77", "5")
+stints = fastnascar.summarize_stints(session.laps, session.pit_stops)
+periods = fastnascar.flag_periods(session.track_status)
+```
+
+Rolling windows break at missing lap numbers or invalid times. Slow laps count
+unless you explicitly filter them. Driver comparisons match **car lap numbers**;
+positive deltas mean the selected driver was slower on that lap. They don't
+represent an on-track gap between lapped cars.
+
+PitRoadTime is the total pit-road duration; ServiceTime is stationary service.
+The pit table also includes entry/exit times, positions gained, and reported tire
+changes. Empty and warm-up placeholders are excluded. Stint summaries use observed
+pit-entry laps, exclude entry and first post-entry laps from pace calculations,
+and include cautions. These are pit intervals, not confirmed tire stints.
+
+Race notes retain source message IDs and driver references. They are commentary,
+which can include cautions, penalties, and strategy, rather than a guaranteed
+official decision log. Flag periods group only consecutive recorded leader laps.
+
+## Season results
+
+```python
+results = fastnascar.get_season_results(2026, series="Cup", errors="skip")
+print(fastnascar.driver_standings(results))
+print(results.attrs["unavailable_races"])
+```
+
+This requests results for every points race in the schedule. Use `race_ids=[...]`
+for a smaller selection. The default raises on unavailable feeds; `errors="skip"`
+reports them in table attributes. Malformed feeds still raise. Driver aggregates
+use driver IDs and include wins, top fives/tens, earned points, laps led, and
+average start/finish. They don't calculate official playoff standings.
+
 ## Practice and qualifying
 
 ```python
@@ -92,16 +139,19 @@ plot_lap_times(session.laps, drivers=["77", "5"])
 plt.show()
 ```
 
-The Bristol example saves a full-race chart, a pace detail view, and a CSV:
+`plot_positions`, `plot_comparison`, and `plot_rolling_pace` are also available
+from `fastnascar.plotting`. Each returns matplotlib axes for customization.
+
+The Bristol comparison example saves rolling pace, positions, and per-lap deltas
+for Hocevar and Larson:
 
 ```sh
-python examples/hocevar_bristol_2026.py
-python examples/hocevar_bristol_2026.py --race spring --show
+python examples/compare_bristol.py
 ```
 
-The default is the September 19, 2026 night race. Files go into `outputs/`.
-On Windows, `examples/hocevar_bristol_2026.ps1` also runs the script using
-an available Python installation or the bundled desktop runtime.
+It uses the September 19, 2026 night race and writes
+`outputs/bristol_2026_comparison.png`. It also prints the field's best 10-lap
+averages and Hocevar's pit-interval pace summaries.
 
 ## Live timing
 
@@ -126,15 +176,35 @@ The default delay is two seconds, with a minimum of one second. LastLapTime
 and ElapsedTime are timedeltas; gaps and status retain the feed's values.
 Polling can miss laps between updates.
 
+Track observed laps without filling in missing times:
+
+```python
+history = fastnascar.LiveHistory()
+for snapshot in fastnascar.iter_live(interval=2, max_updates=10):
+    history.update(snapshot)
+print(history.laps)
+```
+
+History ignores duplicates and stale timestamps, accepts newer lap-time
+corrections, and records missed lap counts. The first observation for a car
+has an unknown missed count. Positions and flags are observed at polling time,
+not necessarily at the lap crossing. Mixing races or timing runs raises an error.
+Pass `series="Xfinity"` or `series="Trucks"` when loading their live session;
+the global feed must currently be serving that series.
+
 Record and replay snapshots:
 
 ```python
-fastnascar.record_live("race.jsonl", interval=2, max_updates=100)
+fastnascar.record_live("race.jsonl", interval=2, max_updates=100, deduplicate=True)
 for snapshot in fastnascar.replay_live("race.jsonl"):
     print(snapshot.timestamp, snapshot.timing.head())
 ```
 
 Recordings append to the file and flush after each update. Replay runs offline.
+Resuming validates the existing file's race/run identity before appending a new
+update. With `deduplicate=True`, identical consecutive payloads are skipped;
+`max_updates` still limits polls. `LiveHistory.from_recording("race.jsonl")`
+reconstructs observed lap history.
 
 ## Cache
 
@@ -163,13 +233,16 @@ Function docstrings describe arguments, return values, and errors.
 Feeds are hosted at `https://cf.nascar.com`:
 
 - Schedule: `cacher/{year}/race_list_basic.json`
-- Results: `cacher/{year}/1/{race_id}/weekend-feed.json`
-- Race laps and flags: `cacher/{year}/1/{race_id}/lap-times.json`
+- Results: `cacher/{year}/{series_id}/{race_id}/weekend-feed.json`
+- Race laps and flags: `cacher/{year}/{series_id}/{race_id}/lap-times.json`
+- Pit timing: `cacher/{year}/{series_id}/{race_id}/live-pit-data.json`
+- Race notes: `cacher/{year}/{series_id}/{race_id}/lap-notes.json`
 - Live timing: `live/feeds/live-feed.json`
 
 Coverage depends on what NASCAR makes available. Verified examples include
 the 2024 Food City 500, the 2026 Bristol night race, and Cup live timing.
-Feed URLs and schemas can change.
+Pit timing and notes were also verified on the 2026 Bristol Xfinity and Trucks
+races. Feed URLs and schemas can change.
 
 Code is MIT licensed. NASCAR feed data and test excerpts aren't covered by
 that license.
@@ -177,7 +250,7 @@ that license.
 ## Development
 
 ```sh
-python -m pip install -e ".[dev]"
+python -m pip install -e ".[plot,dev]"
 python -m unittest discover -s tests -v
 python -m build
 python -m twine check dist/*

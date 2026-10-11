@@ -10,11 +10,12 @@ import pandas as pd
 from .api import NASCARClient
 from ._time import seconds_to_timedelta
 from .exceptions import DataNotAvailableError, InvalidDataError
+from .series import resolve_series
 
 
 @dataclass
 class LiveSnapshot:
-    """One Cup timing update, with timing and pit-stop tables.
+    """One timing update, with timing and pit-stop tables.
 
     Attributes:
         race_id (int): NASCAR race ID.
@@ -27,6 +28,7 @@ class LiveSnapshot:
         pit_stops (pandas.DataFrame): Observed stops with elapsed pit-in/out
             timedeltas. Zero placeholders are excluded; unfinished exits are NaT.
         raw_data (dict): Original decoded response for inspection or recording.
+        series_id (int): NASCAR series ID; Cup=1, Xfinity=2, Trucks=3.
     """
     race_id: int
     run_id: int | None
@@ -36,13 +38,15 @@ class LiveSnapshot:
     timing: pd.DataFrame
     pit_stops: pd.DataFrame
     raw_data: dict
+    series_id: int = 1
 
 
-def parse_snapshot(payload):
-    """Normalize a raw live Cup feed into timing and pit-stop tables.
+def parse_snapshot(payload, *, series=1):
+    """Normalize a live feed into timing and pit-stop tables for a selected series.
 
     Args:
         payload (dict): Decoded current live-feed response.
+        series (int or str): Required series, Cup/1, Xfinity/2, or Trucks/3.
 
     Returns:
         LiveSnapshot: Cars sorted by running position with a UTC source timestamp.
@@ -58,8 +62,9 @@ def parse_snapshot(payload):
     """
     if not isinstance(payload, dict) or not isinstance(payload.get("vehicles"), list):
         raise InvalidDataError("Expected vehicles in the live feed")
-    if payload.get("series_id") != 1:
-        raise DataNotAvailableError("The live feed is currently serving another series, not Cup")
+    series_id = resolve_series(series)
+    if payload.get("series_id") != series_id:
+        raise DataNotAvailableError(f"The live feed is not currently serving series {series_id}")
     if not isinstance(payload.get("race_id"), int):
         raise InvalidDataError("Expected an integer race_id in the live feed")
     rows, pits = [], []
@@ -97,14 +102,15 @@ def parse_snapshot(payload):
     timestamp = pd.to_datetime(payload.get("time_of_day_os"), utc=True, errors="coerce")
     return LiveSnapshot(payload["race_id"], payload.get("run_id"), payload.get("lap_number"),
                         payload.get("flag_state"), timestamp,
-                        timing.sort_values("Position", kind="stable").reset_index(drop=True), pit_stops, payload)
+                        timing.sort_values("Position", kind="stable").reset_index(drop=True), pit_stops, payload, series_id)
 
 
-def get_live_session(*, race_id=None, client=None):
-    """Fetch the current Cup timing snapshot without caching.
+def get_live_session(*, race_id=None, series=1, client=None):
+    """Fetch the current timing snapshot for a selected series without caching.
 
     Args:
-        race_id (int, optional): Require this race ID instead of accepting any Cup race.
+        race_id (int, optional): Require this race ID.
+        series (int or str): Required series, Cup/1, Xfinity/2, or Trucks/3.
         client (NASCARClient, optional): Client to use for the request.
 
     Returns:
@@ -114,14 +120,14 @@ def get_live_session(*, race_id=None, client=None):
         DataNotAvailableError: Network/offline failure, wrong series, or a different race.
         InvalidDataError: Unsupported JSON or live-feed schema.
     """
-    snapshot = parse_snapshot((client or NASCARClient()).live())
+    snapshot = parse_snapshot((client or NASCARClient()).live(), series=series)
     if race_id is not None and snapshot.race_id != race_id:
         raise DataNotAvailableError(f"Live feed is serving race {snapshot.race_id}, not {race_id}")
     return snapshot
 
 
-def iter_live(*, interval=2.0, max_updates=None, race_id=None, client=None):
-    """Poll the current Cup session, yielding each fetched snapshot.
+def iter_live(*, interval=2.0, max_updates=None, race_id=None, series=1, client=None):
+    """Poll the current session for a selected series, yielding fetched snapshots.
 
     Args:
         interval (float): Delay in seconds between updates, at least one second.
@@ -129,6 +135,7 @@ def iter_live(*, interval=2.0, max_updates=None, race_id=None, client=None):
         max_updates (int, optional): Positive snapshot limit. None polls until
             the iterator is closed, interrupted, or encounters an error.
         race_id (int, optional): Require this NASCAR race ID.
+        series (int or str): Required series, Cup/1, Xfinity/2, or Trucks/3.
         client (NASCARClient, optional): Client reused across requests.
 
     Yields:
@@ -149,7 +156,7 @@ def iter_live(*, interval=2.0, max_updates=None, race_id=None, client=None):
     client = client or NASCARClient()
     count, identity = 0, None
     while max_updates is None or count < max_updates:
-        snapshot = get_live_session(race_id=race_id, client=client)
+        snapshot = get_live_session(race_id=race_id, series=series, client=client)
         current = snapshot.race_id, snapshot.run_id
         if identity is not None and current != identity:
             raise DataNotAvailableError("Live feed switched race or timing run")
@@ -160,7 +167,7 @@ def iter_live(*, interval=2.0, max_updates=None, race_id=None, client=None):
             time.sleep(interval)
 
 
-def record_live(path, *, interval=2.0, max_updates=None, race_id=None, client=None):
+def record_live(path, *, interval=2.0, max_updates=None, race_id=None, series=1, deduplicate=False, client=None):
     """Append raw live snapshots to a UTF-8 JSONL file, flushing each update.
 
     Args:
@@ -168,6 +175,9 @@ def record_live(path, *, interval=2.0, max_updates=None, race_id=None, client=No
         interval (float): Delay between updates in seconds, at least one second.
         max_updates (int, optional): Positive limit, or None to record indefinitely.
         race_id (int, optional): Require a specific NASCAR race ID.
+        series (int or str): Required series, Cup/1, Xfinity/2, or Trucks/3.
+        deduplicate (bool): Skip identical consecutive payloads. max_updates
+            limits requests, while the returned count measures records written.
         client (NASCARClient, optional): Client used for polling.
 
     Returns:
@@ -181,19 +191,35 @@ def record_live(path, *, interval=2.0, max_updates=None, race_id=None, client=No
         KeyboardInterrupt: Ctrl+C stops recording; flushed updates remain on disk.
     """
     count = 0
+    expected, previous = None, None
+    recording = Path(path)
+    if recording.exists():
+        for old in replay_live(recording, series=series):
+            identity = old.series_id, old.race_id, old.run_id
+            if expected is not None and expected != identity:
+                raise DataNotAvailableError("Existing recording mixes races or timing runs")
+            expected, previous = identity, old.raw_data
     with Path(path).open("a", encoding="utf-8") as file:
-        for snapshot in iter_live(interval=interval, max_updates=max_updates, race_id=race_id, client=client):
+        for snapshot in iter_live(interval=interval, max_updates=max_updates, race_id=race_id, series=series, client=client):
+            identity = snapshot.series_id, snapshot.race_id, snapshot.run_id
+            if expected is not None and expected != identity:
+                raise DataNotAvailableError("Cannot append a different race/run to this recording")
+            expected = identity
+            if deduplicate and previous == snapshot.raw_data:
+                continue
             file.write(json.dumps(snapshot.raw_data) + "\n")
             file.flush()
             count += 1
+            previous = snapshot.raw_data
     return count
 
 
-def replay_live(path):
+def replay_live(path, *, series=1):
     """Yield snapshots from a JSONL recording without requests or timed delays.
 
     Args:
         path (str or pathlib.Path): Recording produced by ``record_live``.
+        series (int or str): Expected recorded series, Cup/1, Xfinity/2, or Trucks/3.
 
     Yields:
         LiveSnapshot: Parsed snapshots in file order. Blank lines are skipped.
@@ -207,6 +233,97 @@ def replay_live(path):
         for line_number, line in enumerate(file, 1):
             if line.strip():
                 try:
-                    yield parse_snapshot(json.loads(line))
+                    yield parse_snapshot(json.loads(line), series=series)
                 except ValueError as exc:
                     raise InvalidDataError(f"Invalid JSON at recording line {line_number}") from exc
+
+
+class LiveHistory:
+    """Accumulate observed last-lap samples without inventing missed timing data.
+
+    One row is retained per car/lap. Newer corrections replace earlier samples;
+    stale timestamps are ignored. The first update fixes the series/race/run.
+    """
+
+    def __init__(self):
+        """Create an empty history with no established race/run identity."""
+        self._identity = None
+        self._timestamp = pd.NaT
+        self._rows = {}
+        self._latest = {}
+
+    @property
+    def laps(self):
+        """pandas.DataFrame: Observed laps, timestamps, and detected missing counts.
+
+        MissedLaps is unknown for the first observation per car. Position and
+        FlagState are observation-time values, not certified lap-crossing values.
+        """
+        frame = pd.DataFrame(list(self._rows.values()), columns=["DriverNumber", "Driver", "LapNumber", "LapTime", "Speed", "Position", "FlagState", "ObservedAt", "MissedLaps"])
+        frame["LapTime"] = pd.to_timedelta(frame.LapTime).astype("timedelta64[ns]")
+        frame["MissedLaps"] = frame.MissedLaps.astype("Int64")
+        return frame.sort_values(["DriverNumber", "LapNumber"]).reset_index(drop=True)
+
+    def update(self, snapshot):
+        """Incorporate a snapshot and return the count of inserted/corrected laps.
+
+        Args:
+            snapshot (LiveSnapshot): Parsed live timing update.
+
+        Returns:
+            int: Changed lap-time records. Duplicate times and older snapshots
+            cause no change; lap jumps record how many laps were missed.
+
+        Raises:
+            DataNotAvailableError: Series, race, or run differs from prior updates.
+        """
+        identity = snapshot.series_id, snapshot.race_id, snapshot.run_id
+        if self._identity is not None and identity != self._identity:
+            raise DataNotAvailableError("History cannot mix series, races, or timing runs")
+        self._identity = identity
+        if pd.notna(snapshot.timestamp) and pd.notna(self._timestamp) and snapshot.timestamp < self._timestamp:
+            return 0
+        changed = 0
+        for row in snapshot.timing.itertuples():
+            if pd.isna(row.Laps) or row.Laps <= 0 or pd.isna(row.LastLapTime) or row.LastLapTime <= pd.Timedelta(0):
+                continue
+            number, lap = str(row.DriverNumber), int(row.Laps)
+            previous_lap = self._latest.get(number)
+            if previous_lap is not None and lap < previous_lap:
+                continue
+            key = number, lap
+            previous = self._rows.get(key)
+            if previous is not None and previous["LapTime"] == row.LastLapTime:
+                continue
+            missed = (previous["MissedLaps"] if previous else
+                      max(0, lap - previous_lap - 1) if previous_lap is not None else pd.NA)
+            self._rows[key] = {"DriverNumber": number, "Driver": row.Driver, "LapNumber": lap,
+                               "LapTime": row.LastLapTime, "Speed": row.Speed, "Position": row.Position,
+                               "FlagState": snapshot.flag_state, "ObservedAt": snapshot.timestamp,
+                               "MissedLaps": missed}
+            self._latest[number] = lap
+            changed += 1
+        if pd.notna(snapshot.timestamp):
+            self._timestamp = snapshot.timestamp
+        return changed
+
+    @classmethod
+    def from_recording(cls, path, *, series=1):
+        """Rebuild observed lap history from a JSONL recording.
+
+        Args:
+            path (str or pathlib.Path): Recorded snapshot file.
+            series (int or str): Expected series.
+
+        Returns:
+            LiveHistory: History with duplicates, corrections, and gaps processed.
+
+        Raises:
+            InvalidDataError: Invalid recording data.
+            DataNotAvailableError: Wrong series or mixed race/run identities.
+            OSError: Recording cannot be read.
+        """
+        history = cls()
+        for snapshot in replay_live(path, series=series):
+            history.update(snapshot)
+        return history

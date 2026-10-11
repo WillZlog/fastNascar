@@ -8,6 +8,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .cache import Cache
+from .series import resolve_series
 from .exceptions import DataNotAvailableError, InvalidDataError
 
 BASE_URL = "https://cf.nascar.com"
@@ -106,12 +107,13 @@ class NASCARClient:
         """
         return self.get_json(f"cacher/{year}/race_list_basic.json", refresh=refresh)
 
-    def weekend(self, year, race_id, *, refresh=False):
-        """Return raw Cup race and practice/qualifying results for a weekend.
+    def weekend(self, year, race_id, *, series=1, refresh=False):
+        """Return raw race and practice/qualifying results for a weekend.
 
         Args:
             year (int): Season year.
             race_id (int): NASCAR race ID, not the championship round.
+            series (int or str): Cup/1, Xfinity/2, or Trucks/3.
             refresh (bool): Bypass a fresh cache entry.
 
         Returns:
@@ -121,14 +123,15 @@ class NASCARClient:
             DataNotAvailableError: The feed is unavailable.
             InvalidDataError: The response is not valid JSON.
         """
-        return self.get_json(f"cacher/{year}/1/{race_id}/weekend-feed.json", refresh=refresh)
+        return self.get_json(f"cacher/{year}/{resolve_series(series)}/{race_id}/weekend-feed.json", refresh=refresh)
 
-    def laps(self, year, race_id, *, refresh=False):
-        """Return raw Cup race laps and leader-lap flags.
+    def laps(self, year, race_id, *, series=1, refresh=False):
+        """Return raw race laps and leader-lap flags.
 
         Args:
             year (int): Season year.
             race_id (int): NASCAR race ID.
+            series (int or str): Cup/1, Xfinity/2, or Trucks/3.
             refresh (bool): Bypass a fresh cache entry.
 
         Returns:
@@ -138,7 +141,43 @@ class NASCARClient:
             DataNotAvailableError: The feed is unavailable.
             InvalidDataError: The response is not valid JSON.
         """
-        return self.get_json(f"cacher/{year}/1/{race_id}/lap-times.json", refresh=refresh)
+        return self.get_json(f"cacher/{year}/{resolve_series(series)}/{race_id}/lap-times.json", refresh=refresh)
+
+    def pit_stops(self, year, race_id, *, series=1, refresh=False):
+        """Fetch raw pit timing records for a race.
+
+        Args:
+            year (int): Season year.
+            race_id (int): NASCAR race ID.
+            series (int or str): Cup/1, Xfinity/2, or Trucks/3.
+            refresh (bool): Bypass a fresh cache entry.
+
+        Returns:
+            list of dict: Source pit-road and service timing records.
+
+        Raises:
+            DataNotAvailableError: The feed is unavailable.
+            InvalidDataError: The response is not valid JSON.
+        """
+        return self.get_json(f"cacher/{year}/{resolve_series(series)}/{race_id}/live-pit-data.json", refresh=refresh)
+
+    def notes(self, year, race_id, *, series=1, refresh=False):
+        """Fetch raw race commentary keyed by leader lap.
+
+        Args:
+            year (int): Season year.
+            race_id (int): NASCAR race ID.
+            series (int or str): Cup/1, Xfinity/2, or Trucks/3.
+            refresh (bool): Bypass a fresh cache entry.
+
+        Returns:
+            dict: Source commentary with a ``laps`` mapping.
+
+        Raises:
+            DataNotAvailableError: The feed is unavailable.
+            InvalidDataError: The response is not valid JSON.
+        """
+        return self.get_json(f"cacher/{year}/{resolve_series(series)}/{race_id}/lap-notes.json", refresh=refresh)
 
     def live(self):
         """Return the current raw live feed without caching.
@@ -150,6 +189,6 @@ class NASCARClient:
             DataNotAvailableError: A request fails or offline mode is enabled.
             InvalidDataError: The response is not valid JSON.
 
-        Use ``get_live_session`` to validate that the feed is serving Cup.
+        Use ``get_live_session`` to validate that the feed serves the required series.
         """
         return self.get_json("live/feeds/live-feed.json", cache=False)
