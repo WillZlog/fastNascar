@@ -1,0 +1,14 @@
+include README.md LICENSE pyproject.toml
+recursive-include src *.py
+recursive-include examples *.py *.ps1
+recursive-include tests *.py *.json *.md
+prune build
+prune dist
+prune outputs
+prune .plot-deps
+prune .matplotlib
+prune .fastnascar-cache
+prune .release-tools
+prune .release-install
+prune .publish-venv
+global-exclude __pycache__ *.py[cod]
