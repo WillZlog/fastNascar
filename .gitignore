@@ -12,3 +12,4 @@ dist/
 .release-tools/
 .release-install/
 .publish-venv/
+.gitignore
